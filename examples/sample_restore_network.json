@@ -1,0 +1,23 @@
+{
+  "nodes": [
+    {"id": "S",  "type": "source",   "name": "二水厂"},
+    {"id": "A",  "type": "junction"},
+    {"id": "B",  "type": "junction"},
+    {"id": "D",  "type": "junction"},
+    {"id": "E",  "type": "junction"},
+    {"id": "U1", "type": "sink",     "name": "朝阳小区"},
+    {"id": "U2", "type": "sink",     "name": "实验中学"},
+    {"id": "U3", "type": "sink",     "name": "东郊工业园"},
+    {"id": "U4", "type": "sink",     "name": "物流中心"}
+  ],
+  "pipes": [
+    {"id": "P1", "from": "S", "to": "A", "has_valve": true},
+    {"id": "P2", "from": "A", "to": "B", "has_valve": true},
+    {"id": "P3", "from": "A", "to": "U1", "has_valve": true},
+    {"id": "P4", "from": "B", "to": "D", "has_valve": true, "name": "分区总阀"},
+    {"id": "P5", "from": "B", "to": "U2", "has_valve": true},
+    {"id": "P6", "from": "D", "to": "U3", "has_valve": false, "name": "P6 故障管段"},
+    {"id": "P7", "from": "D", "to": "E", "has_valve": true},
+    {"id": "P8", "from": "E", "to": "U4", "has_valve": false, "name": "P8 故障管段"}
+  ]
+}

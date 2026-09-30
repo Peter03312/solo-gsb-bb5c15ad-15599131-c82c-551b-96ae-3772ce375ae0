@@ -1,5 +1,5 @@
 """领域对象 -> 响应 dict 的转换。"""
-from .planning import Node, Pipe, PlanResult
+from .planning import IsolationEvent, Node, Pipe, PlanResult, RestoreResult
 
 
 def serialize_node(node: Node) -> dict:
@@ -40,5 +40,28 @@ def serialize_preview(
         "close_pipe_ids": list(close_pipe_ids),
         "isolatable": result.isolatable,
         "affected_sink_ids": result.affected_sink_ids,
+        "issues": [i.as_dict() for i in result.issues],
+    }
+
+
+def serialize_restore_preview(
+    version: int,
+    expected_version: int,
+    event: IsolationEvent,
+    result: RestoreResult,
+) -> dict:
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        "event_id": event.id,
+        "status": event.status,
+        "fault_pipe_id": event.fault_pipe_id,
+        "closed_pipe_ids": list(event.closed_pipe_ids),
+        "safe": result.safe,
+        "reopened_pipe_ids": result.reopened_pipe_ids,
+        "recoverable_sink_ids": result.recoverable_sink_ids,
+        "still_blocked_sink_ids": result.still_blocked_sink_ids,
+        "remaining_closed_pipe_ids": result.remaining_closed_pipe_ids,
+        "remaining_fault_pipe_ids": result.remaining_fault_pipe_ids,
         "issues": [i.as_dict() for i in result.issues],
     }

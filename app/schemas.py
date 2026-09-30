@@ -49,6 +49,12 @@ class PlanIn(BaseModel):
     version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
 
 
+class RestoreIn(BaseModel):
+    """复供预演 / 确认入参：按隔离事件编号 + 当前管网版本操作。"""
+
+    version: int = Field(ge=0, description="读取管网时的版本号")
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -85,6 +91,9 @@ class IssueOut(BaseModel):
     code: str
     message: str
     pipe_id: str | None = None
+    # 复供阻断原因可能引用具体待修复事件与相关管段（可选，保持向后兼容）
+    event_id: int | None = None
+    related_pipe_id: str | None = None
 
 
 class PreviewOut(BaseModel):
@@ -105,6 +114,32 @@ class SubmitOut(BaseModel):
     event_id: int
 
 
+class RestorePreviewOut(BaseModel):
+    version: int
+    version_match: bool
+    event_id: int
+    status: Literal["pending", "restored"]
+    fault_pipe_id: str
+    closed_pipe_ids: list[str]
+    safe: bool = Field(description="重开后其他待修复故障管段两端是否仍均不可从水源到达")
+    reopened_pipe_ids: list[str] = Field(description="确认复供时将重开的阀门")
+    recoverable_sink_ids: list[str] = Field(description="预计恢复供水的用水点")
+    still_blocked_sink_ids: list[str] = Field(description="本次仍无法恢复的原失供用水点")
+    remaining_closed_pipe_ids: list[str] = Field(description="重开后仍关闭的阀门（其他待修复事件需要）")
+    remaining_fault_pipe_ids: list[str] = Field(description="仍需保持断水的其他待修复故障管段")
+    issues: list[IssueOut]
+
+
+class RestoreConfirmOut(BaseModel):
+    version: int
+    event_id: int
+    status: Literal["pending", "restored"]
+    fault_pipe_id: str
+    reopened_pipe_ids: list[str]
+    recoverable_sink_ids: list[str]
+    still_blocked_sink_ids: list[str]
+
+
 class EventOut(BaseModel):
     id: int
     version_before: int
@@ -112,4 +147,8 @@ class EventOut(BaseModel):
     fault_pipe_id: str
     closed_pipe_ids: list[str]
     affected_sink_ids: list[str]
+    status: Literal["pending", "restored"] = "pending"
+    restored_at: datetime | None = None
+    restored_version: int | None = None
+    reopened_pipe_ids: list[str] = []
     created_at: datetime
