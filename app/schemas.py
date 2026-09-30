@@ -49,6 +49,13 @@ class PlanIn(BaseModel):
     version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
 
 
+class RestoreIn(BaseModel):
+    """复供预演 / 确认入参：按隔离事件编号 + 当前管网版本。"""
+
+    event_id: int = Field(gt=0, description="隔离事件编号")
+    version: int = Field(ge=0, description="读取管网时的版本号")
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -105,6 +112,27 @@ class SubmitOut(BaseModel):
     event_id: int
 
 
+class RestorationPreviewOut(BaseModel):
+    version: int
+    version_match: bool
+    event_id: int
+    status: Literal["pending", "restored"]
+    fault_pipe_id: str
+    closed_pipe_ids: list[str]
+    safe: bool
+    restored_sink_ids: list[str]
+    issues: list[IssueOut]
+
+
+class RestoreOut(BaseModel):
+    version: int
+    event_id: int
+    status: Literal["restored"]
+    fault_pipe_id: str
+    reopened_pipe_ids: list[str]
+    restored_sink_ids: list[str]
+
+
 class EventOut(BaseModel):
     id: int
     version_before: int
@@ -112,4 +140,6 @@ class EventOut(BaseModel):
     fault_pipe_id: str
     closed_pipe_ids: list[str]
     affected_sink_ids: list[str]
+    status: Literal["pending", "restored"] = "pending"
+    restored_at: datetime | None = None
     created_at: datetime

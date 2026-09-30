@@ -1,9 +1,10 @@
-# 供水管网故障隔离服务
+# 供水管网故障隔离 / 复供服务
 
-基于 **Python 3.12 + FastAPI + PostgreSQL** 的供水管网故障隔离服务。
+基于 **Python 3.12 + FastAPI + PostgreSQL** 的供水管网故障隔离与复供服务。
 
 支持录入带编号的**水源(source)**、**用水点(sink)**、**连接点(junction)**及两端节点明确的**管段**（管段可设阀门）；
-针对一条故障管段，预演并提交阀门关闭方案，自动判断**能否隔离**并计算**失供用水点**。
+针对一条故障管段，预演并提交阀门关闭方案，自动判断**能否隔离**并计算**失供用水点**；
+隔离提交后操作员可按**隔离事件编号 + 当前管网版本**预演并确认**复供**，服务在同一事务内复核版本与“重新进水”安全性。
 
 ---
 
@@ -66,11 +67,13 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - 管段两端不可为同一节点 —— 拒绝**自环**；
 - 没有阀门的管段不能标记为已关闭。
 
-**隔离判定**（方案图 = 移除故障管段 + 关闭拟关阀门，**已关闭阀门继续生效**）：
+**隔离判定**（方案图 = 移除本次故障管段与**其他待修复事件的故障管段** + 关闭拟关阀门，**已关闭阀门继续生效**）：
 
 - 仅当故障管段**两端**在方案图中都**无法从任一水源到达**，方案才 `isolatable=true`，方可提交；
 - 失供用水点 = **方案前**由任一水源可达、**方案后**不可达的用水点，按编号（字符串字典序）排序；
-  方案前已经失供的点不会重复计入。
+  方案前已经失供的点不会重复计入；
+- 隔离预演与提交计算都会计入当前**待修复(pending)**事件的故障管段（故障未修复，物理上不通水）；
+  已复供(restored)事件的故障管段恢复为普通管段。
 
 **提交约束**（任一不满足即拒绝且不改任何状态）：
 
@@ -78,19 +81,33 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - 故障管段、拟关管段必须存在；拟关管段必须**带阀门**；
 - 拟关列表不得重复、不得包含故障管段本身；已关闭的阀门不得重复关闭；
 - 方案必须可隔离（`isolatable=true`），否则 `422 NOT_ISOLATABLE`；
-- 提交在**单个数据库事务**内完成：行级锁校验版本 → 更新阀位 → 版本号 +1 → 写隔离事件，原子生效。
-- 整网导入为替换式：重写全部节点/管段、清空历史、版本重置为 `1`。
+- 提交在**单个数据库事务**内完成：行级锁校验版本 → 更新阀位 → 版本号 +1 → 写隔离事件（初始状态 `pending`），原子生效。
+- 整网导入为替换式：重写全部节点/管段、**清空历史（旧事件失效）**、版本重置为 `1`。
+
+**复供判定**（操作员按隔离事件编号 + 当前管网版本预演 / 确认）：
+
+- 事件区分 `pending`（待修复）与 `restored`（已复供）；已复供事件再次预演/确认返回 `409 EVENT_ALREADY_RESTORED`；
+  整网替换后旧事件失效，返回 `404 EVENT_NOT_FOUND`；
+- 复供预演为只读：返回该事件关闭的阀门、预计恢复供水的用水点（方案前不可达、重开后可达，按编号排序）
+  及阻断原因（`RESUPPLY_RISK`，逐条列出会重新进水的待修复故障管段端点），**不改变任何状态**；
+- 计算通水时排除：**其他待修复事件的故障管段** + **仍关闭的阀门**（本事件关闭的阀门按重开计）；
+- 仅当重开后，其余待修复故障管段**两端仍均无法从水源到达**（无重新进水风险）才允许确认；
+  否则 `422 RESUPPLY_UNSAFE`；
+- 确认在**同一事务**内复核：行级锁版本 → 事件存在且仍为 `pending` → 重新计算安全性 →
+  重开本事件阀门 → 版本号 +1 → 事件置为 `restored`；版本过期、事件不存在/已复供、重新进水风险均明确拒绝且不产生部分变更。
 
 ## 五、HTTP API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查 |
-| POST | `/api/network/import` | 整网导入（版本重置为 1） |
+| POST | `/api/network/import` | 整网导入（版本重置为 1，旧事件失效） |
 | GET | `/api/network` | 读取当前管网与版本 |
-| POST | `/api/isolation/preview` | 隔离方案预演（只读） |
-| POST | `/api/isolation/submit` | 提交隔离（原子关阀 + 版本 +1） |
-| GET | `/api/isolation/events` | 隔离操作历史 |
+| POST | `/api/isolation/preview` | 隔离方案预演（只读，计入待修复故障） |
+| POST | `/api/isolation/submit` | 提交隔离（原子关阀 + 版本 +1，事件 pending） |
+| GET | `/api/isolation/events` | 隔离/复供历史（含 `status`、`restored_at`） |
+| POST | `/api/restoration/preview` | 复供预演（只读：阀门、预计恢复用水点、阻断原因） |
+| POST | `/api/restoration/confirm` | 确认复供（事务复核版本与安全，原子开阀 + 版本 +1） |
 
 业务错误统一返回：
 
@@ -205,6 +222,103 @@ curl -s -X POST http://localhost:8000/api/isolation/submit \
 curl -s http://localhost:8000/api/isolation/events
 ```
 
+历史事件结构（新增 `status` / `restored_at`，原有字段保持不变）：
+
+```json
+[
+  {
+    "id": 1,
+    "version_before": 1,
+    "version_after": 2,
+    "fault_pipe_id": "P6",
+    "closed_pipe_ids": ["P4"],
+    "affected_sink_ids": ["U3"],
+    "status": "pending",
+    "restored_at": null,
+    "created_at": "2026-09-30T12:00:00+00:00"
+  }
+]
+```
+
+### 7. 复供预演（只读）
+
+按隔离事件编号与当前管网版本预演：
+
+```bash
+curl -s -X POST http://localhost:8000/api/restoration/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":1,"version":2}'
+```
+
+响应（`safe=true` 才能确认；预演不改阀位、版本与事件状态）：
+
+```json
+{
+  "version": 2,
+  "version_match": true,
+  "event_id": 1,
+  "status": "pending",
+  "fault_pipe_id": "P6",
+  "closed_pipe_ids": ["P4"],
+  "safe": true,
+  "restored_sink_ids": ["U3"],
+  "issues": []
+}
+```
+
+当重开阀门会让**其他待修复**故障管段的端点重新进水时，`safe=false` 并给出阻断原因：
+
+```json
+{
+  "safe": false,
+  "restored_sink_ids": ["U1"],
+  "issues": [
+    {
+      "code": "RESUPPLY_RISK",
+      "message": "重开阀门后，待修复事件 2 的故障管段 P6 的端点 D 将重新从水源进水，存在复供风险",
+      "pipe_id": "P6"
+    }
+  ]
+}
+```
+
+### 8. 确认复供
+
+```bash
+curl -s -X POST http://localhost:8000/api/restoration/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":1,"version":2}'
+```
+
+成功响应（同一事务内重开 P4、版本变为 3、事件置为 `restored`）：
+
+```json
+{
+  "version": 3,
+  "event_id": 1,
+  "status": "restored",
+  "fault_pipe_id": "P6",
+  "reopened_pipe_ids": ["P4"],
+  "restored_sink_ids": ["U3"]
+}
+```
+
+常见拒绝（均不产生部分变更）：
+
+- 版本过期 → `409 VERSION_CONFLICT`；
+- 事件不存在（或整网替换后旧编号失效）→ `404 EVENT_NOT_FOUND`；
+- 事件已复供，重复操作 → `409 EVENT_ALREADY_RESTORED`；
+- 存在重新进水风险 → `422 RESUPPLY_UNSAFE`（`issues` 逐条列明故障管段与进水端点）。
+
+### 9. 多故障复供顺序（环形管网）
+
+当后一个事件借助前一个事件已关的阀门完成隔离时，必须**按反序复供**；
+先复供早期事件会被 `RESUPPLY_UNSAFE` 拒绝。完整演示：
+
+```bash
+python3 examples/demo_restoration.py
+```
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -213,17 +327,18 @@ python3 examples/demo.py
 python3 examples/demo.py http://localhost:8000
 ```
 
-脚本依次演示：导入 → 读取版本 → 不可行/可行预演 → 过期版本 409 → 成功提交 → 重复提交 409 → 重复关阀 422 → 历史。
+脚本依次演示：导入 → 读取版本 → 不可行/可行预演 → 过期版本 409 → 成功提交 →
+重复提交 409 → 重复关阀 422 → 复供预演 → 过期复供 409 → 确认复供 → 重复复供 409 → 历史。
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，17 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，覆盖隔离与复供可达性、重新进水风险）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`）用内存替身替换数据库，覆盖完整 HTTP 契约，需先安装依赖：
+路由层集成测试（`tests/test_api.py`）用内存替身替换数据库，覆盖完整 HTTP 契约（含复供预演/确认、事件失效、复供顺序安全），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -236,15 +351,17 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、方案评估
-  db.py           # PostgreSQL：DDL、快照、整网导入、事务化提交、历史
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离/复供方案评估
+  db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交与复供、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
 examples/
   sample_network.json
-  demo.py
+  demo.py              # 隔离 + 复供完整调用演示
+  demo_restoration.py  # 多故障事件复供顺序（重新进水风险）演示
 tests/
   test_planning.py
+  test_api.py
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -52,8 +52,18 @@ CREATE TABLE IF NOT EXISTS isolation_events (
     fault_pipe_id     TEXT NOT NULL,
     closed_pipe_ids   JSONB NOT NULL,
     affected_sink_ids JSONB NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending', 'restored')),
+    restored_at       TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 兼容升级：为旧版库补充事件状态列（IF NOT EXISTS 需 PG11+，PG16 满足）
+ALTER TABLE isolation_events ADD COLUMN IF NOT EXISTS
+    status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'restored'));
+ALTER TABLE isolation_events ADD COLUMN IF NOT EXISTS
+    restored_at TIMESTAMPTZ;
 """
 
 
@@ -233,37 +243,135 @@ class VersionConflict(Exception):
         super().__init__(f"版本过期：当前版本 {current}，提交基于版本 {expected}")
 
 
+class EventNotFound(Exception):
+    def __init__(self, event_id: int):
+        self.event_id = event_id
+        super().__init__(f"隔离事件不存在：{event_id}")
+
+
+class EventAlreadyRestored(Exception):
+    def __init__(self, event_id: int):
+        self.event_id = event_id
+        super().__init__(f"隔离事件已复供，不能重复复供：{event_id}")
+
+
+# ---------------------------------------------------------------- 复供
+
+
+def _row_to_event_dict(r) -> dict:
+    closed = r["closed_pipe_ids"]
+    affected = r["affected_sink_ids"]
+    # 防御：某些驱动配置下 jsonb 可能返回字符串
+    if isinstance(closed, str):
+        closed = json.loads(closed)
+    if isinstance(affected, str):
+        affected = json.loads(affected)
+    return {
+        "id": r["id"],
+        "version_before": r["version_before"],
+        "version_after": r["version_after"],
+        "fault_pipe_id": r["fault_pipe_id"],
+        "closed_pipe_ids": closed,
+        "affected_sink_ids": affected,
+        "status": r["status"],
+        "restored_at": r["restored_at"],
+        "created_at": r["created_at"],
+    }
+
+
+_EVENT_COLUMNS = (
+    "id, version_before, version_after, fault_pipe_id, "
+    "closed_pipe_ids, affected_sink_ids, status, restored_at, created_at"
+)
+
+
+def get_event(conn, event_id: int, *, for_update: bool = False) -> dict | None:
+    """读取单条隔离事件；for_update=True 时锁定事件行。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM isolation_events WHERE id = %s"
+            f"{' FOR UPDATE' if for_update else ''}",
+            (event_id,),
+        )
+        row = cur.fetchone()
+    return _row_to_event_dict(row) if row else None
+
+
+def list_pending_events(conn, *, for_update: bool = False) -> list[dict]:
+    """读取全部待修复事件（复供计算时计入这些故障管段）。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM isolation_events "
+            f"WHERE status = 'pending' ORDER BY id"
+            f"{' FOR UPDATE' if for_update else ''}"
+        )
+        rows = cur.fetchall()
+    return [_row_to_event_dict(r) for r in rows]
+
+
+def confirm_restoration(
+    conn,
+    expected_version: int,
+    event_id: int,
+    reopen_pipe_ids: list[str],
+    restored_sink_ids: list[str],
+) -> dict:
+    """在已开启的事务内确认复供。
+
+    调用方须先锁版本/事件并完成复核（版本、事件存在且待修复、复供安全）。
+    本函数：锁行复核版本 → 重开本事件阀门 → 版本 +1 → 事件置为 restored。
+    版本过期抛 VersionConflict；事件不存在 / 已复供由调用方在锁行后判定。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
+        row = cur.fetchone()
+        current_version = row[0] if row else 0
+        if current_version != expected_version:
+            raise VersionConflict(current_version, expected_version)
+
+        cur.execute(
+            "SELECT status FROM isolation_events WHERE id = %s FOR UPDATE",
+            (event_id,),
+        )
+        event_row = cur.fetchone()
+        if event_row is None:
+            raise EventNotFound(event_id)
+        if event_row[0] != "pending":
+            raise EventAlreadyRestored(event_id)
+
+        if reopen_pipe_ids:
+            cur.execute(
+                "UPDATE pipes SET valve_closed = FALSE "
+                "WHERE id = ANY(%s) AND has_valve = TRUE",
+                (reopen_pipe_ids,),
+            )
+        new_version = current_version + 1
+        cur.execute(
+            "UPDATE network_meta SET version = %s, updated_at = now() WHERE id = 1",
+            (new_version,),
+        )
+        cur.execute(
+            "UPDATE isolation_events SET status = 'restored', restored_at = now() "
+            "WHERE id = %s AND status = 'pending'",
+            (event_id,),
+        )
+
+    return {
+        "version": new_version,
+        "event_id": event_id,
+        "restored_sink_ids": list(restored_sink_ids),
+        "reopened_pipe_ids": list(reopen_pipe_ids),
+    }
+
+
 # ---------------------------------------------------------------- 历史
 
 
 def list_events(conn, limit: int) -> list[dict]:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, version_before, version_after, fault_pipe_id, "
-            "closed_pipe_ids, affected_sink_ids, created_at "
-            "FROM isolation_events ORDER BY id DESC LIMIT %s",
+            f"SELECT {_EVENT_COLUMNS} FROM isolation_events ORDER BY id DESC LIMIT %s",
             (limit,),
         )
         rows = cur.fetchall()
-
-    events = []
-    for r in rows:
-        closed = r["closed_pipe_ids"]
-        affected = r["affected_sink_ids"]
-        # 防御：某些驱动配置下 jsonb 可能返回字符串
-        if isinstance(closed, str):
-            closed = json.loads(closed)
-        if isinstance(affected, str):
-            affected = json.loads(affected)
-        events.append(
-            {
-                "id": r["id"],
-                "version_before": r["version_before"],
-                "version_after": r["version_after"],
-                "fault_pipe_id": r["fault_pipe_id"],
-                "closed_pipe_ids": closed,
-                "affected_sink_ids": affected,
-                "created_at": r["created_at"],
-            }
-        )
-    return events
+    return [_row_to_event_dict(r) for r in rows]

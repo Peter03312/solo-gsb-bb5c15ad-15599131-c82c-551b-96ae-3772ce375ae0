@@ -7,7 +7,7 @@
 默认 base_url 为 http://localhost:8000。
 
 脚本完整演示：导入管网 -> 读取版本 -> 预演(不可行/可行) -> 提交 ->
-版本过期拒绝 -> 重复关阀拒绝 -> 历史记录。
+版本过期拒绝 -> 重复关阀拒绝 -> 复供预演/确认 -> 历史记录。
 """
 import json
 import os
@@ -95,9 +95,48 @@ def main() -> None:
     show("8. 重复关闭已关阀门 P4（预期 422）", status, body)
     assert status == 422
 
-    # 9. 隔离历史
+    # 9. 复供预演：按事件编号 + 当前版本，只读不改状态
+    event_id = 1
+    status, body = call(
+        "POST",
+        "/api/restoration/preview",
+        {"event_id": event_id, "version": latest},
+    )
+    show("9. 复供预演（预期 safe=true，U3 恢复）", status, body)
+    assert status == 200 and body["safe"] and body["restored_sink_ids"] == ["U3"]
+
+    # 10. 过期版本确认复供 -> 409 VERSION_CONFLICT
+    status, body = call(
+        "POST",
+        "/api/restoration/confirm",
+        {"event_id": event_id, "version": latest - 1},
+    )
+    show("10. 过期版本确认复供（预期 409）", status, body)
+    assert status == 409
+
+    # 11. 确认复供 -> 重开 P4，版本 +1，事件置为 restored
+    status, body = call(
+        "POST",
+        "/api/restoration/confirm",
+        {"event_id": event_id, "version": latest},
+    )
+    show("11. 确认复供（预期成功，新版本 3，P4 重开）", status, body)
+    assert status == 200 and body["version"] == 3
+    assert body["reopened_pipe_ids"] == ["P4"]
+
+    # 12. 对同一事件再次复供 -> 409 EVENT_ALREADY_RESTORED
+    status, body = call(
+        "POST",
+        "/api/restoration/confirm",
+        {"event_id": event_id, "version": 3},
+    )
+    show("12. 重复复供已复供事件（预期 409）", status, body)
+    assert status == 409 and body["error"]["code"] == "EVENT_ALREADY_RESTORED"
+
+    # 13. 隔离历史（事件状态为 restored）
     status, body = call("GET", "/api/isolation/events")
-    show("9. 隔离操作历史", status, body)
+    show("13. 隔离操作历史", status, body)
+    assert body[0]["status"] == "restored"
 
     print("\n全部示例执行完成。")
 
